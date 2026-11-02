@@ -1,10 +1,14 @@
 """Module for Jira search operations."""
 
+import hashlib
 import logging
 import re
+import threading
+import time
 from typing import Any
 
 import requests
+from cachetools import TTLCache
 from requests.exceptions import HTTPError
 
 from ..models.jira import JiraSearchResult
@@ -18,8 +22,126 @@ from .utils import quote_jql_identifier_if_needed, sanitize_jql_reserved_words
 logger = logging.getLogger("mcp-jira")
 
 
+# How long a user's visible project keys are reused before refetching
+VISIBLE_PROJECTS_CACHE_TTL_SECONDS = 300
+VISIBLE_PROJECTS_CACHE_MAXSIZE = 1000
+
+# Shared across requests: a fetcher is created per request, so a cache on the
+# instance would never be reused. Keyed by a digest of the target and the
+# credential, so each user only ever sees their own entry.
+_visible_projects_cache: TTLCache[str, frozenset[str]] = TTLCache(
+    maxsize=VISIBLE_PROJECTS_CACHE_MAXSIZE,
+    ttl=VISIBLE_PROJECTS_CACHE_TTL_SECONDS,
+    # Resolved on each call, so the clock can be patched in tests
+    timer=lambda: time.monotonic(),
+)
+_visible_projects_cache_lock = threading.Lock()
+
+
 class SearchMixin(JiraClient, IssueOperationsProto):
     """Mixin for Jira search operations."""
+
+    def _visible_projects_cache_key(self) -> str | None:
+        """Build the cache key for the current user's visible projects.
+
+        Returns:
+            A digest of the Jira URL, auth type, credential and custom headers,
+            or None when the identity is not fully known from the config
+            (cert or external auth, passthrough headers, no credential), in
+            which case the visible projects are not cached.
+        """
+        config = self.config
+        if config.passthrough_headers:
+            return None
+
+        credential: str | None
+        match config.auth_type:
+            case "oauth" if config.oauth_config:
+                credential = getattr(config.oauth_config, "access_token", None)
+            case "pat":
+                credential = config.personal_token
+            case "basic" if config.api_token:
+                credential = f"{config.username or ''}:{config.api_token}"
+            case _:
+                credential = None
+        if not credential:
+            return None
+
+        headers = sorted((config.custom_headers or {}).items())
+        material = "\x00".join(
+            [config.url, config.auth_type, credential]
+            + [f"{name}\x00{value}" for name, value in headers]
+        )
+
+        return hashlib.sha256(material.encode()).hexdigest()
+
+    def _get_visible_project_keys(self) -> frozenset[str] | None:
+        """Return the upper-cased keys of the projects the current user can browse.
+
+        The result is cached for ``VISIBLE_PROJECTS_CACHE_TTL_SECONDS`` per user.
+
+        Returns:
+            The visible project keys, or None if they could not be fetched.
+        """
+        cache_key = self._visible_projects_cache_key()
+        if cache_key is not None:
+            with _visible_projects_cache_lock:
+                cached = _visible_projects_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
+        try:
+            projects = self.jira.projects()
+        except (requests.RequestException, ValueError) as e:
+            logger.warning(f"Could not fetch the projects visible to the user: {e}")
+            return None
+
+        if not isinstance(projects, list):
+            return None
+
+        keys = frozenset(
+            str(p["key"]).upper()
+            for p in projects
+            if isinstance(p, dict) and p.get("key")
+        )
+
+        if cache_key is not None:
+            with _visible_projects_cache_lock:
+                _visible_projects_cache[cache_key] = keys
+
+        return keys
+
+    def _get_accessible_config_projects_filter(self) -> str | None:
+        """Narrow ``config.projects_filter`` to the projects the user can browse.
+
+        Jira rejects a whole query that names a project the user cannot see
+        ("The value 'X' does not exist for the field 'project'"), so one
+        inaccessible project in the allowlist would break every search.
+
+        Returns:
+            The comma-separated accessible allowlist, the full allowlist if the
+            visible projects could not be fetched, or None if no allowlist is set.
+
+        Raises:
+            ValueError: If the user can see none of the allowlisted projects.
+        """
+        if not self.config.projects_filter:
+            return None
+
+        visible = self._get_visible_project_keys()
+        if visible is None:
+            return self.config.projects_filter
+
+        allowed = [p.strip() for p in self.config.projects_filter.split(",")]
+
+        accessible = [p for p in allowed if p and p.upper() in visible]
+        if not accessible:
+            raise ValueError(
+                "None of the projects in JIRA_PROJECTS_FILTER "
+                f"({self.config.projects_filter}) are accessible to the current user"
+            )
+
+        return ",".join(accessible)
 
     def _apply_projects_filter(
         self, jql: str, projects_filter: str | None = None
@@ -32,7 +154,8 @@ class SearchMixin(JiraClient, IssueOperationsProto):
         (both are ANDed), never replace it — otherwise the tool argument would
         defeat the operator's allowlist in shared-credential deployments.
         """
-        for filter_str in (self.config.projects_filter, projects_filter):
+        config_filter = self._get_accessible_config_projects_filter()
+        for filter_str in (config_filter, projects_filter):
             if filter_str:
                 jql = self._and_projects_filter(jql, filter_str)
         return jql

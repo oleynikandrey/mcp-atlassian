@@ -1,14 +1,50 @@
 """Tests for the Jira Search mixin."""
 
+from collections.abc import Iterator
 from typing import Any
-from unittest.mock import ANY, MagicMock
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 import requests
 
 from mcp_atlassian.jira import JiraFetcher
-from mcp_atlassian.jira.search import SearchMixin
+from mcp_atlassian.jira.search import (
+    VISIBLE_PROJECTS_CACHE_TTL_SECONDS,
+    SearchMixin,
+    _visible_projects_cache,
+)
 from mcp_atlassian.models.jira import JiraIssue, JiraSearchResult
+
+
+def _all_allowlisted_projects_visible(mixin: SearchMixin) -> None:
+    """Make the mocked user able to see every project in config.projects_filter."""
+    mixin.jira.projects.side_effect = lambda *args, **kwargs: [
+        {"key": key.strip()}
+        for key in (mixin.config.projects_filter or "").split(",")
+        if key.strip()
+    ]
+
+
+def _set_visible_projects(mixin: SearchMixin, keys: list[str]) -> None:
+    """Make the mocked user able to see exactly the given projects."""
+    mixin.jira.projects.side_effect = None
+    mixin.jira.projects.return_value = [{"key": key} for key in keys]
+
+
+def _use_pat_credential(config: MagicMock, token: str = "user-a-token") -> None:
+    """Give a mocked config a PAT, so its visible projects are cached."""
+    config.auth_type = "pat"
+    config.personal_token = token
+    config.passthrough_headers = None
+    config.custom_headers = None
+
+
+@pytest.fixture(autouse=True)
+def _clear_visible_projects_cache() -> Iterator[None]:
+    """The visible projects cache is module-level; isolate it per test."""
+    _visible_projects_cache.clear()
+    yield
+    _visible_projects_cache.clear()
 
 
 class TestSearchMixin:
@@ -27,6 +63,8 @@ class TestSearchMixin:
         mixin.config.is_cloud = False
         mixin.config.projects_filter = None
         mixin.config.url = "https://example.atlassian.net"
+        _use_pat_credential(mixin.config)
+        _all_allowlisted_projects_visible(mixin)
 
         return mixin
 
@@ -1272,6 +1310,8 @@ class TestSearchFilterAndInjectionRegression:
         mixin.config.is_cloud = False
         mixin.config.projects_filter = None
         mixin.config.url = "https://example.atlassian.net"
+        _use_pat_credential(mixin.config)
+        _all_allowlisted_projects_visible(mixin)
         return mixin
 
     @pytest.mark.security_regression
@@ -1356,3 +1396,171 @@ class TestSearchFilterAndInjectionRegression:
             "config allowlist must still be applied even when a projects_filter arg "
             f"is supplied; JQL was {sent_jql!r}"
         )
+
+    def test_config_projects_filter_drops_projects_user_cannot_see(
+        self, search_mixin: SearchMixin, mock_issues_response: dict
+    ) -> None:
+        """Allowlisted projects the user cannot browse are left out of the JQL.
+
+        Jira rejects the whole query (400, "The value 'DEV' does not exist for
+        the field 'project'") when it names a project the user has no access to,
+        so one inaccessible allowlisted project would break every search.
+        """
+        search_mixin.config.projects_filter = "TEST,DEV"
+        _set_visible_projects(search_mixin, ["TEST", "OTHER"])
+        search_mixin.jira.jql.return_value = mock_issues_response
+
+        search_mixin.search_issues("text ~ 'x'")
+
+        sent_jql = search_mixin.jira.jql.call_args[0][0]
+        assert sent_jql == "(text ~ 'x') AND (project = TEST)"
+
+    def test_config_projects_filter_matches_visible_keys_case_insensitively(
+        self, search_mixin: SearchMixin, mock_issues_response: dict
+    ) -> None:
+        """Allowlist keys match the user's visible projects regardless of case."""
+        search_mixin.config.projects_filter = "test, dev"
+        _set_visible_projects(search_mixin, ["TEST", "DEV"])
+        search_mixin.jira.jql.return_value = mock_issues_response
+
+        search_mixin.search_issues("text ~ 'x'")
+
+        sent_jql = search_mixin.jira.jql.call_args[0][0]
+        assert sent_jql == "(text ~ 'x') AND (project IN (test, dev))"
+
+    @pytest.mark.security_regression
+    def test_config_projects_filter_with_no_visible_project_refuses_search(
+        self, search_mixin: SearchMixin
+    ) -> None:
+        """If the user can see none of the allowlisted projects, do not search.
+
+        Dropping the allowlist clause would search every project the user can see.
+        """
+        search_mixin.config.projects_filter = "TEST,DEV"
+        _set_visible_projects(search_mixin, ["OTHER"])
+
+        with pytest.raises(Exception, match="JIRA_PROJECTS_FILTER"):
+            search_mixin.search_issues("text ~ 'x'")
+
+        search_mixin.jira.jql.assert_not_called()
+
+    def test_config_projects_filter_kept_when_project_list_fails(
+        self, search_mixin: SearchMixin, mock_issues_response: dict
+    ) -> None:
+        """If the visible projects cannot be fetched, the full allowlist is used."""
+        search_mixin.config.projects_filter = "TEST,DEV"
+        search_mixin.jira.projects.side_effect = requests.RequestException("boom")
+        search_mixin.jira.jql.return_value = mock_issues_response
+
+        search_mixin.search_issues("text ~ 'x'")
+
+        sent_jql = search_mixin.jira.jql.call_args[0][0]
+        assert sent_jql == "(text ~ 'x') AND (project IN (TEST, DEV))"
+
+    @staticmethod
+    def _request_fetcher(template: SearchMixin) -> SearchMixin:
+        """A new fetcher for one request, like the server creates per tool call.
+
+        It shares the template's config and mocked Jira client, but nothing
+        cached on the template instance.
+        """
+        with patch("atlassian.Jira"):
+            fetcher = JiraFetcher(config=template.config)
+        fetcher.jira = template.jira
+        fetcher._clean_text = template._clean_text
+        return fetcher
+
+    def test_visible_projects_are_cached_across_requests(
+        self, search_mixin: SearchMixin, mock_issues_response: dict
+    ) -> None:
+        """Visible projects are fetched once per user, not on every tool call.
+
+        The server builds a new fetcher for every request, so the cache must
+        outlive the fetcher instance.
+        """
+        search_mixin.config.projects_filter = "TEST,DEV"
+        _set_visible_projects(search_mixin, ["TEST"])
+        search_mixin.jira.jql.return_value = mock_issues_response
+
+        self._request_fetcher(search_mixin).search_issues("text ~ 'x'")
+        self._request_fetcher(search_mixin).search_issues("text ~ 'y'")
+
+        assert search_mixin.jira.projects.call_count == 1
+        sent_jql = search_mixin.jira.jql.call_args[0][0]
+        assert sent_jql == "(text ~ 'y') AND (project = TEST)"
+
+    @pytest.mark.security_regression
+    def test_visible_projects_are_not_shared_between_credentials(
+        self, search_mixin: SearchMixin, mock_issues_response: dict
+    ) -> None:
+        """Another user's cached projects must never narrow (or widen) a search."""
+        search_mixin.config.projects_filter = "TEST,DEV"
+        search_mixin.jira.jql.return_value = mock_issues_response
+
+        _set_visible_projects(search_mixin, ["TEST"])
+        self._request_fetcher(search_mixin).search_issues("text ~ 'x'")
+
+        _use_pat_credential(search_mixin.config, token="user-b-token")
+        _set_visible_projects(search_mixin, ["DEV"])
+        self._request_fetcher(search_mixin).search_issues("text ~ 'x'")
+
+        assert search_mixin.jira.projects.call_count == 2
+        sent_jql = search_mixin.jira.jql.call_args[0][0]
+        assert sent_jql == "(text ~ 'x') AND (project = DEV)"
+
+    @pytest.mark.parametrize(
+        "identity",
+        ["passthrough_headers", "cert_auth", "no_credential"],
+    )
+    def test_visible_projects_not_cached_without_known_identity(
+        self, search_mixin: SearchMixin, mock_issues_response: dict, identity: str
+    ) -> None:
+        """When the config does not identify the user, fetch every time."""
+        search_mixin.config.projects_filter = "TEST,DEV"
+        _set_visible_projects(search_mixin, ["TEST"])
+        search_mixin.jira.jql.return_value = mock_issues_response
+        if identity == "passthrough_headers":
+            search_mixin.config.passthrough_headers = ["X-User"]
+        elif identity == "cert_auth":
+            search_mixin.config.auth_type = "cert"
+        else:
+            search_mixin.config.personal_token = None
+
+        self._request_fetcher(search_mixin).search_issues("text ~ 'x'")
+        self._request_fetcher(search_mixin).search_issues("text ~ 'y'")
+
+        assert search_mixin.jira.projects.call_count == 2
+
+    def test_visible_projects_are_refetched_after_cache_ttl(
+        self, search_mixin: SearchMixin, mock_issues_response: dict
+    ) -> None:
+        """Access changes are picked up once the cached visible projects expire."""
+        search_mixin.config.projects_filter = "TEST,DEV"
+        _set_visible_projects(search_mixin, ["TEST"])
+        search_mixin.jira.jql.return_value = mock_issues_response
+        clock = [1000.0]
+
+        with patch(
+            "mcp_atlassian.jira.search.time.monotonic", side_effect=lambda: clock[0]
+        ):
+            self._request_fetcher(search_mixin).search_issues("text ~ 'x'")
+            _set_visible_projects(search_mixin, ["DEV"])
+            clock[0] += VISIBLE_PROJECTS_CACHE_TTL_SECONDS + 1
+            self._request_fetcher(search_mixin).search_issues("text ~ 'x'")
+
+        assert search_mixin.jira.projects.call_count == 2
+        sent_jql = search_mixin.jira.jql.call_args[0][0]
+        assert sent_jql == "(text ~ 'x') AND (project = DEV)"
+
+    def test_board_issues_drop_projects_user_cannot_see(
+        self, search_mixin: SearchMixin
+    ) -> None:
+        """Board issue queries get the same narrowed allowlist."""
+        search_mixin.config.projects_filter = "TEST,DEV"
+        _set_visible_projects(search_mixin, ["DEV"])
+        search_mixin.jira.get_issues_for_board.return_value = {"issues": []}
+
+        search_mixin.get_board_issues("1", "status = Open")
+
+        sent_jql = search_mixin.jira.get_issues_for_board.call_args.kwargs["jql"]
+        assert sent_jql == "(status = Open) AND (project = DEV)"
