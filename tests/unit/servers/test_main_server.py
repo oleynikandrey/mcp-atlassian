@@ -704,6 +704,32 @@ class TestUserTokenMiddleware:
             is expected
         )
 
+    @pytest.mark.parametrize(
+        ("path", "expected"),
+        [
+            ("/confluence/mcp", True),
+            ("/confluence/healthz", False),
+        ],
+    )
+    def test_should_process_auth_ignores_mount_root_path(
+        self, middleware, path, expected
+    ):
+        """Under a Starlette Mount the scope keeps the full path and carries
+        the prefix in root_path; the MCP endpoint must still be recognized."""
+        middleware.auth_endpoints = frozenset({("POST", "/mcp")})
+
+        assert (
+            middleware._should_process_auth(
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": path,
+                    "root_path": "/confluence",
+                }
+            )
+            is expected
+        )
+
     @pytest.mark.anyio
     async def test_missing_auth_is_allowed_when_global_fallback_is_enabled(
         self, middleware, mock_scope, mock_receive, mock_send, monkeypatch
@@ -922,3 +948,67 @@ class TestUserTokenMiddlewareSsrfValidation:
         middleware.app.assert_called_once()
         passed_scope = middleware.app.call_args[0][0]
         assert passed_scope["state"].get("auth_validation_error") in (None, "")
+
+
+@pytest.mark.anyio
+async def test_mounted_http_app_serves_under_prefix_with_root_healthz(monkeypatch):
+    """With a mount path, the MCP app lives under the prefix and /healthz
+    stays reachable at the root for Kubernetes probes."""
+    monkeypatch.setattr(main_mcp, "mount_path", "/confluence")
+
+    app = main_mcp.http_app()
+
+    assert app.state.path == "/confluence/mcp"
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        assert (await client.get("/healthz")).status_code == 200
+        assert (await client.get("/confluence/healthz")).status_code == 200
+        assert (await client.get("/mcp")).status_code == 404
+
+
+@pytest.mark.anyio
+async def test_mounted_http_app_exposes_oauth_discovery_at_root(monkeypatch):
+    """OAuth discovery documents are path-scoped at the host root (RFC 8414 /
+    RFC 9728) while the operational endpoints live under the mount path."""
+    from mcp_atlassian.servers.main import AtlassianMCP, _build_auth_provider
+
+    monkeypatch.setenv("ATLASSIAN_OAUTH_PROXY_ENABLE", "true")
+    monkeypatch.setenv("ATLASSIAN_OAUTH_CLIENT_ID", "client-id")
+    monkeypatch.setenv("ATLASSIAN_OAUTH_CLIENT_SECRET", "client-secret")
+    monkeypatch.setenv("ATLASSIAN_OAUTH_SCOPE", "WRITE")
+    monkeypatch.setenv(
+        "ATLASSIAN_OAUTH_REDIRECT_URI", "https://test/confluence/callback"
+    )
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://test/confluence")
+    monkeypatch.setenv("CONFLUENCE_URL", "https://confluence.example.com")
+    monkeypatch.delenv("JIRA_URL", raising=False)
+    monkeypatch.delenv("ATLASSIAN_OAUTH_INSTANCE_URL", raising=False)
+
+    provider = _build_auth_provider()
+    assert provider is not None
+    server = AtlassianMCP("Mounted MCP", auth=provider)
+    server.mount_path = "/confluence"
+
+    app = server.http_app()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="https://test"
+    ) as client:
+        resource = await client.get(
+            "/.well-known/oauth-protected-resource/confluence/mcp"
+        )
+        assert resource.status_code == 200
+        assert resource.json()["resource"] == "https://test/confluence/mcp"
+
+        metadata = await client.get(
+            "/.well-known/oauth-authorization-server/confluence"
+        )
+        assert metadata.status_code == 200
+        assert (
+            metadata.json()["authorization_endpoint"]
+            == "https://test/confluence/authorize"
+        )
+
+        # Operational endpoints are served under the prefix, not at the root.
+        assert (await client.get("/confluence/authorize")).status_code != 404
+        assert (await client.get("/authorize")).status_code == 404

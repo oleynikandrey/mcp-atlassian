@@ -416,6 +416,8 @@ def main(
 
     from mcp_atlassian.servers import main_mcp
 
+    main_mcp.mount_path = main_mcp.normalize_mount_path(os.getenv("MCP_MOUNT_PATH"))
+
     run_kwargs = {
         "transport": final_transport,
     }

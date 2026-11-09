@@ -188,3 +188,19 @@ class TestMainTransportSelection:
                             assert (
                                 mock_exit.call_args_list[1][0][0] == 0
                             )  # Finally exit
+
+
+def test_mount_path_env_configures_server(monkeypatch):
+    """MCP_MOUNT_PATH is normalized and applied to the server before it runs."""
+    from mcp_atlassian.servers import main_mcp
+
+    monkeypatch.setattr(main_mcp, "mount_path", None)
+    monkeypatch.setenv("TRANSPORT", "streamable-http")
+    monkeypatch.setenv("MCP_MOUNT_PATH", "confluence/")
+    with patch("asyncio.run"), patch("sys.argv", ["mcp-atlassian"]):
+        try:
+            main()
+        except SystemExit:
+            pass
+
+    assert main_mcp.mount_path == "/confluence"

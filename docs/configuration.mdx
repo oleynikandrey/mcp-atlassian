@@ -192,6 +192,7 @@ openssl rsa -in encrypted.key -out decrypted.key
 | `CONFLUENCE_ATTACHMENT_DOWNLOAD_USE_V1` | Download Confluence attachments via the v1 REST endpoint instead of the legacy `/download/` link (removed on Cloud). Unset = auto (v1 on Cloud, legacy on Server/DC); `true`/`false` to force. |
 | `ATLASSIAN_OAUTH_PROXY_ENABLE` | Enable OAuth proxy + DCR + `/.well-known/*` routes (`true`/`false`) |
 | `PUBLIC_BASE_URL` | Public base URL for OAuth discovery metadata |
+| `MCP_MOUNT_PATH` | URL prefix to serve the whole server under (e.g. `/confluence`) when several MCP servers share one host; OAuth discovery stays path-scoped at the host root |
 | `ATLASSIAN_OAUTH_ALLOWED_CLIENT_REDIRECT_URIS` | Comma-separated allowed redirect URI patterns for DCR clients |
 | `ATLASSIAN_OAUTH_ALLOWED_GRANT_TYPES` | Comma-separated grant types allowed during DCR |
 | `ATLASSIAN_OAUTH_REQUIRE_CONSENT` | Require local consent page before upstream redirect (`true`/`false`) |

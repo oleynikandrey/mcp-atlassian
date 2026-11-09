@@ -19,6 +19,7 @@ from mcp.types import Tool as MCPTool
 from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from starlette.routing import BaseRoute, Mount, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from mcp_atlassian.confluence.config import ConfluenceConfig
@@ -210,6 +211,17 @@ class AtlassianMCP(ErrorPreservingFastMCP[MainAppContext]):
     """Custom FastMCP server class for Atlassian integration with tool filtering."""
 
     _active_streamable_http_path: str | None = None
+    # Public URL prefix the whole app (MCP endpoint, OAuth routes, /healthz) is
+    # served under, e.g. "/confluence" when several MCP servers share a host.
+    mount_path: str | None = None
+
+    @staticmethod
+    def normalize_mount_path(raw: str | None) -> str | None:
+        """Normalize ``MCP_MOUNT_PATH``; empty or "/" means no mount."""
+        if raw is None:
+            return None
+        normalized = AtlassianMCP._normalize_http_path(raw)
+        return None if normalized == "/" else normalized
 
     @staticmethod
     def _normalize_http_path(path: str) -> str:
@@ -417,7 +429,31 @@ class AtlassianMCP(ErrorPreservingFastMCP[MainAppContext]):
             allowed_hosts=allowed_hosts,
             allowed_origins=allowed_origins,
         )
-        return app
+        if not self.mount_path:
+            return app
+        return self._mount_http_app(app, self.mount_path, final_path)
+
+    def _mount_http_app(
+        self, app: StarletteWithLifespan, mount_path: str, mcp_path: str | None
+    ) -> StarletteWithLifespan:
+        """Serve ``app`` under ``mount_path`` behind a shared host.
+
+        FastMCP mounts the OAuth operational routes (/authorize, /token, ...)
+        at the app root and advertises them under the public base URL, so the
+        app itself is mounted under the prefix. OAuth discovery documents are
+        path-scoped at the host root (RFC 8414 / RFC 9728), so they are
+        re-exposed there, and /healthz stays at the root for probes.
+        """
+        routes: list[BaseRoute] = []
+        if self.auth is not None:
+            routes.extend(self.auth.get_well_known_routes(mcp_path=mcp_path))
+        routes.append(
+            Route("/healthz", health_check, methods=["GET"], include_in_schema=False)
+        )
+        routes.append(Mount(mount_path, app=app))
+        mounted = StarletteWithLifespan(routes=routes, lifespan=app.lifespan)
+        mounted.state.path = f"{mount_path}{getattr(app.state, 'path', '')}"
+        return mounted
 
 
 class UserTokenMiddleware:
@@ -549,6 +585,21 @@ class UserTokenMiddleware:
         )
         await send({"type": "http.response.body", "body": body})
 
+    @staticmethod
+    def _route_path(scope: Scope) -> str:
+        """Request path relative to the app's mount point.
+
+        Under a Starlette ``Mount`` the scope keeps the full path in ``path``
+        and carries the prefix in ``root_path``.
+        """
+        path: str = scope.get("path", "")
+        root_path: str = scope.get("root_path", "")
+        if root_path and path.startswith(root_path):
+            remainder = path[len(root_path) :]
+            if not remainder or remainder.startswith("/"):
+                return remainder or "/"
+        return path
+
     def _should_process_auth(self, scope: Scope) -> bool:
         """Check if this request should be processed for authentication."""
         if not self.mcp_server_ref:
@@ -556,7 +607,7 @@ class UserTokenMiddleware:
 
         try:
             method = scope.get("method", "").upper()
-            request_path = AtlassianMCP._normalize_http_path(scope.get("path", ""))
+            request_path = AtlassianMCP._normalize_http_path(self._route_path(scope))
             if self.auth_endpoints is not None:
                 return (method, request_path) in self.auth_endpoints
 
